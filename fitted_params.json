@@ -1,50 +1,50 @@
 {
   "params": {
-    "a_p": 0.0016575068145480406,
-    "b_p": 1.0373923942097463e-12,
-    "c_p": 142.15956444311178,
-    "a_d": 0.2517278510875284,
-    "b_d": 359.5972607794794,
-    "t_c": 20.273290123953743,
-    "alpha": 0.9949999999999999
+    "a_p": 0.0021780390204767814,
+    "b_p": 0.0,
+    "c_p": 140.42626471416514,
+    "a_d": 0.07933242261989075,
+    "b_d": 202.26741536038918,
+    "alpha": 0.99,
+    "t_c": 21.14689564948015
   },
   "train_metrics": {
-    "mape": 12.80966249256922,
-    "mae": 5.21099722177432,
-    "rmse": 7.08341473872883,
-    "r2": 0.9977155018398175
+    "mape": 13.348475465137524,
+    "mae": 5.747952101094728,
+    "rmse": 8.640093809541856,
+    "r2": 0.9867921801199414
   },
   "test_metrics": {
-    "mape": 12.738292503448648,
-    "mae": 5.193821607240011,
-    "rmse": 7.047748949996922,
-    "r2": 0.9978586926026597
+    "mape": 13.149355693719222,
+    "mae": 5.67506662246391,
+    "rmse": 8.60996163701303,
+    "r2": 0.9868076497251731
   },
-  "approach": "Approach 1 (Grid search + Linear Regression)",
+  "approach": "Approach 2 (Non-linear optimization)",
   "data_summary": {
-    "total_records": 40345,
-    "filtered_records": 39941,
-    "train_size": 31952,
-    "test_size": 7989,
-    "unique_frequencies": 56,
+    "total_records": 101161,
+    "filtered_records": 34446,
+    "train_size": 27556,
+    "test_size": 6890,
+    "unique_frequencies": 61,
     "freq_range": [
       510.0,
-      1335.0
+      1410.0
     ],
-    "pure_prefill_batches": 9271,
-    "pure_decode_batches": 27944,
-    "mixed_batches": 3130,
+    "pure_prefill_batches": 3639,
+    "pure_decode_batches": 94914,
+    "mixed_batches": 2608,
     "prefill_lq_range": [
       32,
       4096
     ],
     "decode_lkv_range": [
       32,
-      2126
+      2846
     ],
     "batch_size_range": [
       1,
-      48
+      64
     ]
   }
 }

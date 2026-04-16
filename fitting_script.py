@@ -107,10 +107,11 @@ def compute_mape(y_true, y_pred):
 
 
 def approach1_grid_search(features_train, y_train, features_test, y_test):
-    """Grid search over alpha + linear regression."""
+    """Grid search over alpha + non-negative linear regression."""
+    from sklearn.linear_model import LinearRegression
     best_mape = float("inf")
     best_alpha = None
-    best_model = None
+    best_coefs = None
 
     alphas = np.arange(0.01, 1.0, 0.005)
 
@@ -118,30 +119,29 @@ def approach1_grid_search(features_train, y_train, features_test, y_test):
         X_train = build_design_matrix(features_train, alpha)
         X_test = build_design_matrix(features_test, alpha)
 
-        model = LinearRegression(fit_intercept=False)
-        model.fit(X_train, y_train)
+        # Use non-negative least squares for physically meaningful params
+        from scipy.optimize import nnls
+        coefs, _ = nnls(X_train, y_train)
 
-        y_pred_test = model.predict(X_test)
+        y_pred_test = X_test @ coefs
         mape = compute_mape(y_test, y_pred_test)
 
         if mape < best_mape:
             best_mape = mape
             best_alpha = alpha
-            best_model = model
+            best_coefs = coefs
 
-    # Extract parameters
-    coefs = best_model.coef_
     params = {
-        "a_p": coefs[0],
-        "b_p": coefs[1],
-        "c_p": coefs[2],
-        "a_d": coefs[3],
-        "b_d": coefs[4],
-        "t_c": coefs[5],
+        "a_p": best_coefs[0],
+        "b_p": best_coefs[1],
+        "c_p": best_coefs[2],
+        "a_d": best_coefs[3],
+        "b_d": best_coefs[4],
+        "t_c": best_coefs[5],
         "alpha": best_alpha,
     }
 
-    return params, best_model, best_mape
+    return params, best_coefs, best_mape
 
 
 def approach2_nonlinear(features, y, initial_params):
@@ -163,7 +163,9 @@ def approach2_nonlinear(features, y, initial_params):
 
     def loss(params):
         y_pred = predict(params)
-        return np.mean((y - y_pred) ** 2)
+        # Use MAPE as loss for better percentage-based optimization
+        mask = y > 0
+        return np.mean(np.abs((y[mask] - y_pred[mask]) / y[mask]))
 
     x0 = [
         initial_params["a_p"],
@@ -176,13 +178,13 @@ def approach2_nonlinear(features, y, initial_params):
     ]
 
     bounds = [
-        (None, None),   # a_p
-        (None, None),   # b_p
-        (None, None),   # c_p
-        (None, None),   # a_d
-        (None, None),   # b_d
+        (0, None),      # a_p >= 0
+        (0, None),      # b_p >= 0
+        (0, None),      # c_p >= 0
+        (0, None),      # a_d >= 0
+        (0, None),      # b_d >= 0
         (0.01, 0.99),   # alpha
-        (None, None),   # t_c
+        (0, None),      # t_c >= 0
     ]
 
     result = minimize(loss, x0, method="L-BFGS-B", bounds=bounds,
@@ -301,6 +303,26 @@ def main():
     p01 = np.percentile(y, 0.5)
     mask = (y <= p99) & (y >= p01)
     records_filtered = [r for r, m in zip(records, mask) if m]
+
+    # Balance dataset: subsample decode-only to avoid drowning prefill/mixed
+    rng = np.random.RandomState(args.seed)
+    prefill_recs = [r for r in records_filtered
+                    if set(req["type"] for req in r["requests"]) == {"prefill"}]
+    decode_recs = [r for r in records_filtered
+                   if set(req["type"] for req in r["requests"]) == {"decode"}]
+    mixed_recs = [r for r in records_filtered
+                  if len(set(req["type"] for req in r["requests"])) > 1]
+
+    # Cap decode-only at 5x the size of (prefill + mixed) combined
+    max_decode = 5 * (len(prefill_recs) + len(mixed_recs))
+    if len(decode_recs) > max_decode:
+        idx = rng.choice(len(decode_recs), size=max_decode, replace=False)
+        decode_recs = [decode_recs[i] for i in idx]
+        print(f"\nBalancing: subsampled decode-only from {n_decode_only} to {len(decode_recs)}")
+
+    records_filtered = prefill_recs + decode_recs + mixed_recs
+    rng.shuffle(records_filtered)
+
     features_filtered, y_filtered = compute_features(records_filtered)
     print(f"\nAfter outlier removal (0.5%-99.5%): {len(records_filtered)} records")
 
@@ -324,7 +346,7 @@ def main():
     print("Approach 1: Grid search over alpha + Linear Regression")
     print("=" * 60)
 
-    params1, model1, mape1 = approach1_grid_search(
+    params1, _, mape1 = approach1_grid_search(
         features_train, y_train, features_test, y_test)
 
     print(f"\nBest alpha: {params1['alpha']:.4f}")

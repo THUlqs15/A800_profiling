@@ -145,10 +145,10 @@ def run_profiling_at_frequency(engine, gpu_freq, time_limit_s=120):
         steps_a += 1
 
     # --- Phase C: Decode-only, varying batch sizes and l_kv ---
-    while elapsed() < time_limit_s * 0.60:
-        bs = random.choice([1, 2, 4, 8, 16, 32])
+    while elapsed() < time_limit_s * 0.65:
+        bs = random.choice([1, 2, 4, 8, 16])
         prompt_len = random.choice([32, 64, 128])
-        max_tok = random.choice([20, 50, 100])
+        max_tok = random.choice([50, 100, 200, 500, 800, 1000])
         for _ in range(bs):
             ids = gen_prompt(prompt_len)
             engine.add_request(
@@ -157,29 +157,28 @@ def run_profiling_at_frequency(engine, gpu_freq, time_limit_s=120):
                 request_id=make_id("pc"))
         while engine.has_unfinished_requests():
             engine.step()
-            if elapsed() > time_limit_s * 0.65:
+            if elapsed() > time_limit_s * 0.70:
                 break
         # If time exceeded, break
-        if elapsed() > time_limit_s * 0.65:
+        if elapsed() > time_limit_s * 0.70:
             break
 
     # Drain remaining
     drain_start = time.time()
     while engine.has_unfinished_requests():
         engine.step()
-        if time.time() - drain_start > 30:
+        if time.time() - drain_start > 60:
             break
 
     # --- Phase D: Mixed batches via continuous injection ---
     # Inject new prefill requests while decode requests are running
-    # Use short decode (max_tokens=30-80) so they finish quickly
     mix_start = time.time()
-    # Start background decoding
+    # Start background decoding with longer sequences
     for _ in range(random.choice([4, 8, 16])):
         ids = gen_prompt(random.choice([32, 64, 128]))
         engine.add_request(
             prompt={"prompt_token_ids": ids},
-            params=SamplingParams(max_tokens=random.choice([30, 50, 80]),
+            params=SamplingParams(max_tokens=random.choice([100, 200, 400, 600]),
                                   temperature=0.8, ignore_eos=True),
             request_id=make_id("pd"))
 
@@ -191,7 +190,7 @@ def run_profiling_at_frequency(engine, gpu_freq, time_limit_s=120):
             n_inject = random.randint(1, 4)
             for _ in range(n_inject):
                 pl = random.choice(prefill_lengths[:7])  # up to 2048
-                mt = random.choice([20, 40, 60, 80])
+                mt = random.choice([50, 100, 200, 400, 600, 800])
                 ids = gen_prompt(pl)
                 engine.add_request(
                     prompt={"prompt_token_ids": ids},
@@ -224,7 +223,7 @@ def main():
     parser.add_argument("--output", type=str,
                         default="/home/ubuntu/lqs/profiling_data.jsonl")
     parser.add_argument("--min-freq", type=int, default=500)
-    parser.add_argument("--time-per-freq", type=int, default=90,
+    parser.add_argument("--time-per-freq", type=int, default=120,
                         help="Time budget per frequency in seconds")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
