@@ -179,11 +179,24 @@ python fitting_script.py \
     --output-dir /home/ubuntu/lqs
 ```
 
-This reads the profiling data, balances the dataset (subsamples decode-only batches to avoid overwhelming prefill/mixed), fits the 7-parameter model using:
-1. Grid search over alpha with NNLS (non-negative least squares) regression
-2. Non-linear optimization (scipy L-BFGS-B) with MAPE loss and non-negative parameter constraints
+This reads the profiling data, balances the dataset (subsamples decode-only batches to avoid overwhelming prefill/mixed), and fits the **9-parameter Route B+** batch latency model:
 
-Saves `fitted_params.json` with all parameters and metrics.
+```
+T_pd(f, B) = (1/f)       * [ w_pf  * I{has_prefill}
+                             + a_p * sum(l_q^2)
+                             + b_p * sum(l_q * l_kv)
+                             + c_p * sum(l_q) ]
+           + (1/f^alpha) * [ w_dec * I{has_decode}
+                             + a_d * sum(l_kv_decode)
+                             + b_d * num_decode ]
+           + t_c
+```
+
+`w_pf` and `w_dec` are *per-batch amortized overheads* (weight loading / kernel launch cost that is paid once per batch, not once per request). Without these terms, the optimizer is forced to lump ~20 ms into a single batch-level `t_c`, which inflates the decode MAPE to ~14% because that single overhead dominates short (~29 ms) decode batches.
+
+Fit uses scipy L-BFGS-B with MAPE loss, non-negative parameter constraints, `alpha in [0.01, 1.0]`, and multi-start initialization over `alpha0 in {0.3, 0.5, 0.7, 0.9, 0.99}` x `w_pf0 in {5000, 10000, 15000}` x `w_dec0 in {5000, 10000, 15000}` (45 starts total); the best is selected by training-set MAPE.
+
+Saves `fitted_params.json` with all parameters and metrics (train/test + per-type on the full dataset).
 
 ## Full Scripts
 
@@ -202,11 +215,12 @@ Key design choices:
 See `fitting_script.py` in this repository.
 
 Key design choices:
-- **Data balancing**: decode-only batches capped at 5x (prefill + mixed) to prevent imbalance
-- **NNLS regression**: non-negative least squares ensures physically meaningful parameters
-- **MAPE loss**: approach 2 uses MAPE (not MSE) as optimization objective for better percentage-based fitting
-- **Non-negative bounds**: all 7 parameters constrained >= 0 in non-linear optimization
-- **Outlier removal**: 0.5%-99.5% percentile filtering
+- **Route B+ (9-parameter) model**: per-batch prefill overhead `w_pf`, per-batch decode overhead `w_dec`, per-request prefill terms (`a_p`, `b_p`, `c_p`), per-request decode terms (`a_d`, `b_d`), frequency exponent `alpha`, residual constant `t_c`.
+- **Data balancing**: decode-only batches capped at 5x (prefill + mixed) to prevent imbalance.
+- **Multi-start L-BFGS-B with MAPE loss**: 45 starts over a grid of `alpha0` x `w_pf0` x `w_dec0`; MAPE (not MSE) chosen so that large-wall-time prefill batches don't dominate the objective.
+- **Non-negative bounds on all 9 parameters**; `alpha` bounded to `[0.01, 1.0]` (0 < alpha <= 1 is the physically meaningful range for memory-bandwidth-bound decode on a GPU with a fixed memory clock).
+- **Outlier removal**: 0.5%-99.5% percentile filtering.
+- **Evaluation on the full 101K dataset** is reported alongside the balanced-subsample train/test metrics, broken out by batch type (prefill / mixed / decode) with Spearman rank correlation to verify scheduler-ordering quality, not just point accuracy.
 
 ## Quick Start
 
@@ -238,5 +252,6 @@ python fitting_script.py \
 - Memory clock locking (`--lock-memory-clocks`) is not supported on A800-SXM4-80GB but only one memory clock (1593 MHz) is available, so it remains constant.
 - The `sys.path` fix in `profiling_script.py` is needed because running from the same directory as the vllm source creates a namespace package conflict with the editable install.
 - GPU frequencies below 500 MHz are skipped to avoid extremely slow execution with large models.
-- The fitting script uses a fine grid (step=0.005) for alpha search and compares NNLS grid search with scipy L-BFGS-B non-linear optimization (MAPE loss), selecting whichever gives lower test MAPE.
+- The fitting script uses scipy L-BFGS-B (MAPE loss) with 45 multi-start initializations over `(alpha0, w_pf0, w_dec0)`; the run selects the starting point that yields the lowest training MAPE.
 - Decode-only batches dominate the dataset (~94%) due to long decode sequences. The fitting script balances this by subsampling decode-only to 5x the combined count of prefill + mixed batches.
+- The earlier 7-parameter model (without `w_pf`, `w_dec`) collapsed all per-batch overhead into a single `t_c ~= 21 ms`, which caused decode MAPE to sit near 14% because that overhead dominates ~29 ms decode batches. Route B+ factors the overhead into frequency-scaled prefill/decode pieces, dropping overall MAPE from 13.73% to 4.82% and lifting decode Spearman rank correlation from 0.58 to 0.97 -- the latter matters directly for a latency-ranking scheduler.

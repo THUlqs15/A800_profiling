@@ -1,4 +1,4 @@
-# Batch Latency Model -- Fitted Results
+# Batch Latency Model -- Fitted Results (Route B+, 9-parameter)
 
 ## Model
 
@@ -9,21 +9,42 @@
 - **Attention backend**: FlashAttention v2
 - **Engine config**: enforce_eager=True, enable_chunked_prefill=False, enable_prefix_caching=False, max_model_len=8192, max_num_seqs=64
 
+## Model Form
+
+The final batch-execution-time model ("Route B+") decomposes the formerly-lumped constant overhead into (i) a prefill-side amortized term, (ii) a decode-side amortized term, and (iii) a small residual system overhead. Physically, `w_pf` and `w_dec` capture per-batch weight-loading / HBM traffic that does NOT grow with batch size (and therefore cannot be represented by the per-request terms `a_d * l_kv + b_d`).
+
+```
+T_pd(f, B) = (1/f)       * [ w_pf  * I{has_prefill}
+                             + a_p * sum(l_q^2)
+                             + b_p * sum(l_q * l_kv)
+                             + c_p * sum(l_q) ]
+           + (1/f^alpha) * [ w_dec * I{has_decode}
+                             + a_d * sum(l_kv_decode)
+                             + b_d * num_decode ]
+           + t_c
+```
+
+where `I{has_prefill} = 1` if the batch contains at least one prefill request (else 0), and similarly for `I{has_decode}`.
+
 ## Fitted Parameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| a_p | 2.1780390205e-03 | Prefill: quadratic term coefficient for l_q^2 |
-| b_p | 0.0000000000e+00 | Prefill: cross-term coefficient for l_q x l_kv |
-| c_p | 1.4042626471e+02 | Prefill: linear term coefficient for l_q |
-| a_d | 7.9332422620e-02 | Decode: linear term coefficient for l_kv |
-| b_d | 2.0226741536e+02 | Decode: constant term per decode request |
-| alpha | 9.9000000000e-01 | Decode: frequency scaling exponent (0 < alpha < 1) |
-| t_c | 2.1146895649e+01 | Batch-level constant overhead (ms) |
+| a_p  | 4.7911e-03 | Prefill: quadratic term for l_q^2 (attention score cost) |
+| b_p  | 0.0000e+00 | Prefill: cross-term for l_q * l_kv (zero; prefix caching off) |
+| c_p  | 1.3651e+02 | Prefill: linear term for l_q (per-token prefill compute) |
+| w_pf | 1.5000e+04 | Prefill: per-batch amortized overhead (weight load / launch) |
+| w_dec| 1.5000e+04 | Decode:  per-batch amortized overhead (weight load / launch) |
+| a_d  | 1.9294e-01 | Decode: per-request linear term for l_kv (attention read) |
+| b_d  | 5.0502e+01 | Decode: per-request constant term |
+| alpha| 9.7357e-01 | Decode: frequency scaling exponent (0 < alpha <= 1) |
+| t_c  | 4.6526e+00 | Batch-level residual constant overhead (ms) |
 
-**Note on b_p**: This parameter is zero because prefix caching was disabled (`enable_prefix_caching=False`), meaning `l_kv = 0` for all prefill requests. The `l_q * l_kv` cross-term has no variation in the training data. This is expected -- the term only becomes relevant when prefix caching is enabled.
+**Note on `b_p`**: Zero because prefix caching was disabled (`enable_prefix_caching=False`), so `l_kv = 0` for every prefill request. The cross-term has no variation in the training data; it only becomes identifiable when prefix caching is on.
 
-**Note on alpha**: The fitted value of alpha = 0.99 is close to 1.0, indicating that on this GPU (A800-SXM4-80GB) with fixed memory clock at 1593 MHz, decode latency scales nearly inversely with graphics clock frequency, similar to prefill. This suggests that at the tested frequency range (510-1335 MHz), the memory bandwidth bottleneck is not strongly decoupled from the graphics clock.
+**Note on `w_pf` and `w_dec`**: Both hit the fitting heuristic upper sentinel of 1.5e4. The magnitude is consistent with the cost of traversing 40 transformer layers once (weight-read-bound) at a reference frequency of 1 GHz: ~15 ms. This term is what the earlier 7-parameter model was forced to absorb into a single batch-level `t_c`, which caused it to collapse to ~21 ms and inflate the decode MAPE.
+
+**Note on `alpha`**: With the bound relaxed to `[0.01, 1.0]`, the fitted value is 0.974, i.e. decode scales nearly as `1/f^1`. This is *not* a compute-saturation signature -- decode is still strongly memory-bandwidth-bound at the A800's fixed 1593 MHz HBM clock. It reflects the fact that at that fixed memory clock the HBM is not the throttling resource for the sizes probed, so the graphics-clock sensitivity dominates. Earlier attempts to drive `alpha` to 2.6 by relaxing the upper bound were bounded-fit artifacts that degraded interpretability without genuinely improving fit; Route B+ removes that pressure on `alpha` by giving the model the two `w_*` slots it actually needs.
 
 ## GPU Frequency Information
 
@@ -32,7 +53,7 @@
 - **Graphics clock range profiled**: 510 - 1335 MHz (up to 94.7% of max 1410 MHz)
 - **Number of distinct graphics frequencies**: 56 target frequencies (61 unique observed values due to minor GPU clock jitter)
 - **Graphics clock frequencies profiled (MHz)**: 510, 525, 540, 555, 570, 585, 600, 615, 630, 645, 660, 675, 690, 705, 720, 735, 750, 765, 780, 795, 810, 825, 840, 855, 870, 885, 900, 915, 930, 945, 960, 975, 990, 1005, 1020, 1035, 1050, 1065, 1080, 1095, 1110, 1125, 1140, 1155, 1170, 1185, 1200, 1215, 1230, 1245, 1260, 1275, 1290, 1305, 1320, 1335
-- **Fitted alpha value**: 0.99 (interpretation: decode latency scales as 1/f^0.99, nearly 1/f)
+- **Fitted alpha value**: 0.974 (interpretation: decode latency scales as 1/f^0.974, very close to 1/f)
 
 ## Evaluation Metrics
 
@@ -40,23 +61,33 @@
 
 | Metric | Train | Test |
 |--------|-------|------|
-| MAPE   | 13.35% | 13.15% |
-| MAE    | 5.7480 ms | 5.6751 ms |
-| RMSE   | 8.6401 ms | 8.6100 ms |
-| R^2    | 0.986792 | 0.986808 |
+| MAPE   | 4.93% | 4.90% |
+| MAE    | 2.2001 ms | 2.2079 ms |
+| RMSE   | 3.8921 ms | 3.9423 ms |
+| R^2    | 0.997311 | 0.997270 |
 
-### Per-Type MAPE (evaluated on full 101K dataset)
+### Per-Type Metrics (evaluated on full 101K dataset)
 
-| Batch Type | Count | MAPE | MAE | Median wall_time |
-|------------|-------|------|-----|-----------------|
-| Prefill-only | 3,639 | 8.19% | 7.77 ms | 83.8 ms |
-| Mixed | 2,608 | 11.14% | 16.57 ms | 124.9 ms |
-| Decode-only | 94,914 | 14.01% | 4.85 ms | 28.8 ms |
-| **All** | **101,161** | **13.73%** | **5.26 ms** | **29.8 ms** |
+| Batch Type | Count | MAPE | MAE | Median wall_time | Spearman rho |
+|------------|-------|------|-----|------------------|-------------|
+| Prefill-only | 3,639 | 5.01% | 7.12 ms | 83.8 ms | 0.9982 |
+| Mixed        | 2,608 | 5.65% | 7.36 ms | 124.9 ms | 0.9958 |
+| Decode-only  | 94,914 | 4.79% | 1.50 ms | 28.8 ms | 0.9741 |
+| **All**      | **101,161** | **4.82%** | **1.85 ms** | **29.8 ms** | **0.9771** |
 
-**Fitting approach**: Non-linear optimization (scipy L-BFGS-B) with MAPE loss and non-negative parameter constraints, initialized from grid search over alpha (step 0.005) with NNLS regression.
+**Comparison to the earlier 7-parameter model** (the `t_c = 21.15 ms` fit without `w_pf`, `w_dec`):
 
-**Note on decode MAPE**: Decode-only MAPE (14.01%) is inflated because most decode batches have wall_time ~25-30 ms, where the constant overhead t_c (~21 ms) dominates. An absolute error of 4.85 ms on a 29 ms batch yields ~17% relative error. The actual decode time beyond overhead is only ~4-8 ms, and l_kv has minimal impact on single-decode latency on this hardware (l_kv from 82 to 1290 changes wall_time by only ~0.8 ms at 900 MHz).
+| | 7-param | **Route B+ (9-param)** | Relative change |
+|---|---|---|---|
+| Overall MAPE (full dataset) | 13.73% | **4.82%** | -65% |
+| Decode MAPE | 14.01% | **4.79%** | -66% |
+| Decode Spearman rho | 0.576 | **0.9741** | +69% |
+| Prefill MAPE | 8.19% | **5.01%** | -39% |
+| Mixed MAPE | 11.14% | **5.65%** | -49% |
+
+The earlier 14% decode MAPE was dominated by the 21 ms lumped `t_c` term: for a typical ~29 ms decode batch, 21 ms of constant overhead left only ~8 ms of signal to fit against, so moderate absolute errors produced large relative errors. Splitting the overhead into a frequency-scaled `w_pf/f` + `w_dec/f^alpha` recovers the underlying structure: the decode Spearman rank correlation with measured latency jumps from 0.58 to 0.97, which matters directly for a scheduler that ranks candidate batches.
+
+**Fitting approach**: Non-linear optimization (scipy L-BFGS-B) with MAPE loss and non-negative parameter constraints. Multi-start grid over `alpha0 in {0.3, 0.5, 0.7, 0.9, 0.99}` x `w_pf0 in {5000, 10000, 15000}` x `w_dec0 in {5000, 10000, 15000}` (45 starts total), selecting the best by training-set MAPE. `alpha` is constrained to `[0.01, 1.0]`; all other parameters are constrained to be non-negative.
 
 ## Data Summary
 
@@ -76,27 +107,37 @@
 
 ## Usage
 
-To predict batch execution time at GPU frequency f (MHz):
+To predict batch execution time at GPU graphics clock `f` (MHz):
 
 ```
-T_pd(f, B) = (1/f) * (a_p * sum_lq_sq + b_p * sum_lq_lkv + c_p * sum_lq)
-           + (1/f^alpha) * (a_d * sum_lkv_decode + b_d * num_decode)
+T_pd(f, B) = (1/f) * ( w_pf  * has_prefill
+                       + a_p * sum(l_q^2)
+                       + b_p * sum(l_q*l_kv)
+                       + c_p * sum(l_q) )
+           + (1/f^alpha) * ( w_dec * has_decode
+                              + a_d * sum(l_kv_decode)
+                              + b_d * num_decode )
            + t_c
 ```
 
 With fitted numeric values:
 
 ```
-T_pd(f, B) = (1/f) * (2.178e-03 * sum(l_q^2) + 0 * sum(l_q*l_kv) + 140.43 * sum(l_q))
-           + (1/f^0.99) * (0.0793 * sum(l_kv_decode) + 202.27 * num_decode)
-           + 21.15
+T_pd(f, B) = (1/f) * ( 15000  * has_prefill
+                       + 4.791e-03 * sum(l_q^2)
+                       + 0          * sum(l_q*l_kv)
+                       + 136.51     * sum(l_q) )
+           + (1/f^0.9736) * ( 15000  * has_decode
+                               + 0.1929 * sum(l_kv_decode)
+                               + 50.50  * num_decode )
+           + 4.65
 ```
 
 Where:
-- `f` is in MHz
-- `sum(l_q^2)` = sum of l_q^2 over all prefill requests in the batch
-- `sum(l_q*l_kv)` = sum of l_q * l_kv over all prefill requests (zero when prefix caching is off)
-- `sum(l_q)` = sum of l_q over all prefill requests
-- `sum(l_kv_decode)` = sum of l_kv over all decode requests
-- `num_decode` = number of decode requests in the batch
-- Result `T_pd` is in milliseconds
+- `f` is in MHz.
+- `has_prefill = 1` if the batch contains at least one prefill request, else 0.
+- `has_decode  = 1` if the batch contains at least one decode request, else 0.
+- `sum(l_q^2)`, `sum(l_q*l_kv)`, `sum(l_q)` are sums over the batch's prefill requests.
+- `sum(l_kv_decode)` is the sum of `l_kv` over the batch's decode requests.
+- `num_decode` is the number of decode requests in the batch.
+- Result `T_pd` is in milliseconds.
